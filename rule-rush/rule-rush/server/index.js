@@ -25,8 +25,11 @@ const app = createApp({
   log: (...a) => console.error('[rule-rush]', ...a),
 });
 
+// Render / Fly / Railway / Docker inject PORT and expect the process to bind ALL interfaces.
+// Default to 0.0.0.0 so the platform health check can reach the port (127.0.0.1 fails scans).
+// Override with HOST=127.0.0.1 only for local-only binds.
 const port = parseInt(env.PORT || '8080', 10);
-const host = env.HOST || '127.0.0.1';
+const host = env.HOST || '0.0.0.0';
 app.listen(port, host).then((p) => {
   console.log('Rule Rush listening on http://' + host + ':' + p);
   if (!env.BOT_TOKEN || !env.BOT_USERNAME) console.warn('! BOT_TOKEN / BOT_USERNAME not set: Telegram login is disabled.');
