@@ -125,6 +125,11 @@ function createApp(options) {
 
   /* ---------------- domain logic ---------------- */
   const publicUser = (u) => ({ name: displayName(u), photo: u.photo_url || '', username: u.username || '' });
+  const meUser = (u) => Object.assign({}, publicUser(u), {
+    phone: u.phone || '',
+    hasPhone: Boolean(u.phone),
+    language: u.language || '',
+  });
 
   function trialsFor(userId, day) {
     const rows = db.prepare('SELECT tier, COUNT(*) AS n FROM runs WHERE user_id = ? AND day = ? GROUP BY tier').all(userId, day);
@@ -164,7 +169,10 @@ function createApp(options) {
   }
 
   function issueSession(user, source) {
-    const token = Auth.createSession(db, user.id, source, cfg.now());
+    // Mint a fresh long-lived token; prune previous sessions for this user+source.
+    const token = Auth.createOrReuseSession
+      ? Auth.createOrReuseSession(db, user.id, source, cfg.now())
+      : Auth.createSession(db, user.id, source, cfg.now());
     const cookie = Auth.sessionCookieHeader(token, {
       secure: cfg.cookieSecure,
       maxAgeSec: Math.floor(Auth.SESSION_TTL_MS / 1000),
@@ -260,7 +268,15 @@ function createApp(options) {
          FROM awards a JOIN prizes p ON p.id = a.prize_id JOIN sponsors s ON s.id = p.sponsor_id
         WHERE a.user_id = ? AND a.status != 'rejected' ORDER BY a.id DESC LIMIT 20`
     ).all(ctx.user.id);
-    return { json: { user: publicUser(ctx.user), trials: trialsFor(ctx.user.id, day), resetsAt: nextMidnight(now), best, awards } };
+    return { json: { user: meUser(ctx.user), trials: trialsFor(ctx.user.id, day), resetsAt: nextMidnight(now), best, awards } };
+  });
+
+  // Optional: attach phone after WebApp.requestContact (or any verified client that already has a session).
+  route('POST', '/api/me/phone', 'user', (ctx) => {
+    const phone = Auth.cleanPhone(String(ctx.body.phone || ctx.body.phone_number || ''));
+    if (!phone) fail(400, 'bad_phone');
+    const user = Auth.setUserPhone(db, ctx.user.id, phone, cfg.now());
+    return { json: { ok: true, user: meUser(user) } };
   });
 
   route('POST', '/api/run/start', 'user', (ctx) => {
@@ -470,12 +486,15 @@ function createApp(options) {
   };
   const CSP = [
     "default-src 'self'",
-    "script-src 'self' https://telegram.org",
-    "frame-src https://oauth.telegram.org",
-    "img-src 'self' data: https://t.me https://*.telegram.org https://*.cdn-telegram.org",
+    "script-src 'self' https://telegram.org https://*.telegram.org",
+    "frame-src https://oauth.telegram.org https://telegram.org",
+    "img-src 'self' data: https: blob:",
     "style-src 'self' 'unsafe-inline'",
-    "connect-src 'self'",
-    "frame-ancestors 'self' https://web.telegram.org https://webk.telegram.org https://webz.telegram.org",
+    "connect-src 'self' https://telegram.org",
+    // Allow embedding inside every Telegram Web / Desktop shell
+    "frame-ancestors 'self' https://web.telegram.org https://webk.telegram.org https://webz.telegram.org https://telegram.org https://*.telegram.org",
+    "base-uri 'self'",
+    "object-src 'none'",
   ].join('; ');
 
   function send(res, status, body, headers) {
@@ -501,14 +520,35 @@ function createApp(options) {
     });
   }
 
+  function sendIndex(res) {
+    const headers = {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Content-Security-Policy': CSP,
+    };
+    return send(res, 200, fs.readFileSync(path.join(cfg.rootDir, 'index.html')), headers);
+  }
+
   async function handle(req, res) {
     const url = new URL(req.url, 'http://localhost');
-    const p = url.pathname;
+    // Normalize trailing slash (except root) so Mini App deep-links still match.
+    let p = url.pathname || '/';
+    if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
+
+    // CORS preflight (rare for same-origin Mini App, harmless if present)
+    if (req.method === 'OPTIONS') {
+      return send(res, 204, '', {
+        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Max-Age': '86400',
+      });
+    }
 
     if (req.method === 'GET' && STATIC[p]) {
       const [file, type] = STATIC[p];
       const headers = { 'Content-Type': type };
       if (file === 'index.html') headers['Content-Security-Policy'] = CSP;
+      // Cache static JS/CSS briefly so Mini App reloads feel snappy; HTML stays no-store via securityHeaders.
+      if (file !== 'index.html') headers['Cache-Control'] = 'public, max-age=300';
       return send(res, 200, fs.readFileSync(path.join(cfg.rootDir, file)), headers);
     }
 
@@ -519,7 +559,27 @@ function createApp(options) {
       const m = r.re.exec(p);
       if (m) { matched = r; params = m.slice(1); break; }
     }
-    if (!matched) return send(res, 404, JSON.stringify({ error: 'not_found' }), { 'Content-Type': 'application/json' });
+
+    // SPA catch-all for Telegram Mini App deep-links / path rewrites.
+    // Only for clean, extension-less page paths — never for files or server/data paths.
+    if (!matched) {
+      const isGet = req.method === 'GET' || req.method === 'HEAD';
+      const blocked =
+        p.startsWith('/api') ||
+        p.startsWith('/admin') ||
+        p.startsWith('/auth') ||
+        p.startsWith('/server') ||
+        p.startsWith('/data') ||
+        p.startsWith('/test') ||
+        p === '/package.json' ||
+        p === '/package-lock.json' ||
+        p === '/README.md' ||
+        /\.[a-zA-Z0-9]{1,8}$/.test(p); // any path that looks like a file (*.js, *.db, …)
+      if (isGet && !blocked) {
+        return sendIndex(res);
+      }
+      return send(res, 404, JSON.stringify({ error: 'not_found' }), { 'Content-Type': 'application/json' });
+    }
 
     try {
       rateLimit('ip:' + clientIp(req), 300, 60000);
@@ -564,7 +624,7 @@ function createApp(options) {
     server,
     db,
     dailySeed,
-    listen: (port, host) => new Promise((resolve) => server.listen(port, host || '127.0.0.1', () => resolve(server.address().port))),
+    listen: (port, host) => new Promise((resolve) => server.listen(port, host || '0.0.0.0', () => resolve(server.address().port))),
     close: () => new Promise((resolve) => { server.close(() => { try { db.close(); } catch (e) { /* ignore */ } resolve(); }); if (server.closeAllConnections) server.closeAllConnections(); }),
   };
 }
