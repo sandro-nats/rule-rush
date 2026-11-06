@@ -4,10 +4,24 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <meta name="theme-color" content="#0b1020">
+  <meta name="color-scheme" content="dark">
+  <!-- Absolute paths so deep-link / Mini App pathnames never break CSS/JS loads -->
   <title>Rule Rush</title>
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="/style.css">
   <!-- Telegram Mini App SDK. Harmless in a normal browser (window.Telegram.WebApp.initData is then empty). -->
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script>
+    /* Early ready/expand so Telegram shell paints correctly before main.js. */
+    (function () {
+      try {
+        var tw = window.Telegram && window.Telegram.WebApp;
+        if (!tw) return;
+        tw.ready();
+        tw.expand();
+        if (typeof tw.disableVerticalSwipes === 'function') tw.disableVerticalSwipes();
+      } catch (e) { /* ignore */ }
+    })();
+  </script>
 </head>
 <body>
   <div id="app">
@@ -32,6 +46,7 @@
       <div id="account" class="card">
         <div id="acc-out">
           <p class="acc-prompt" data-i18n="loginPrompt"></p>
+          <p id="tg-autologin" class="muted" hidden>Signing in with Telegram…</p>
           <div id="tg-widget" class="tg-widget"></div>
           <p id="login-error" class="err" hidden data-i18n="loginFailed"></p>
           <p id="login-hint" class="muted" hidden data-i18n="loginUnavailable"></p>
@@ -167,8 +182,9 @@
     <div id="toast" class="toast" role="alert"></div>
   </div>
 
-  <script src="core.js"></script>
-  <script src="i18n.js"></script>
-  <script src="main.js"></script>
+  <!-- Absolute paths so nested Mini App URLs still load scripts -->
+  <script src="/core.js"></script>
+  <script src="/i18n.js"></script>
+  <script src="/main.js"></script>
 </body>
 </html>
