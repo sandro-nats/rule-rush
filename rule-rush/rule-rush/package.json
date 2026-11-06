@@ -1,0 +1,12 @@
+{
+  "name": "rule-rush",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Rule Rush: skill-based reflex / precision / logic game for Telegram (web + Mini App) with server-verified daily trials and sponsor-funded leaderboards.",
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "DEV_AUTH=1 ADMIN_TOKEN=dev-admin node --disable-warning=ExperimentalWarning server/index.js",
+    "test": "node test/core.test.js && node --disable-warning=ExperimentalWarning test/server.test.js"
+  }
+}

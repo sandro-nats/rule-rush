@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0b1020">
+  <title>Rule Rush</title>
+  <link rel="stylesheet" href="style.css">
+  <!-- Telegram Mini App SDK. Harmless in a normal browser (window.Telegram.WebApp.initData is then empty). -->
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <div id="app">
+
+    <!-- MENU -->
+    <section id="screen-menu" class="screen active">
+      <header class="brand">
+        <svg class="logo" viewBox="0 0 96 32" aria-hidden="true">
+          <circle cx="16" cy="16" r="11" fill="#ff4d5e" stroke="#fff" stroke-width="2"/>
+          <rect x="37" y="5" width="22" height="22" rx="4" fill="#3fa0ff" stroke="#fff" stroke-width="2"/>
+          <polygon points="80,4 92,26 68,26" fill="#2ee59d" stroke="#fff" stroke-width="2" stroke-linejoin="round"/>
+        </svg>
+        <h1 data-i18n="title">Rule Rush</h1>
+        <p class="tagline" data-i18n="tagline"></p>
+      </header>
+
+      <div class="lang" role="group" aria-label="Language">
+        <button type="button" data-lang="en" aria-pressed="true">EN</button>
+        <button type="button" data-lang="ka" aria-pressed="false">ქარ</button>
+      </div>
+
+      <div id="account" class="card">
+        <div id="acc-out">
+          <p class="acc-prompt" data-i18n="loginPrompt"></p>
+          <div id="tg-widget" class="tg-widget"></div>
+          <p id="login-error" class="err" hidden data-i18n="loginFailed"></p>
+          <p id="login-hint" class="muted" hidden data-i18n="loginUnavailable"></p>
+          <form id="dev-form" class="dev" hidden>
+            <input id="dev-name" type="text" maxlength="30" placeholder="dev user name" autocomplete="off">
+            <button type="submit">Dev login</button>
+          </form>
+        </div>
+        <div id="acc-in" class="acc-in" hidden>
+          <span id="acc-avatar" class="avatar"></span>
+          <span id="acc-name" class="acc-name"></span>
+          <button type="button" id="btn-logout" class="link" data-i18n="logout"></button>
+        </div>
+      </div>
+
+      <div class="tiers" id="menu-tiers" role="group">
+        <button type="button" data-tier="easy"></button>
+        <button type="button" data-tier="medium"></button>
+        <button type="button" data-tier="hard"></button>
+      </div>
+      <p id="tier-desc" class="muted center"></p>
+
+      <div class="modes">
+        <button type="button" class="mode primary" id="btn-daily">
+          <span class="mode-title" data-i18n="daily"></span>
+          <span class="mode-sub" id="daily-sub"></span>
+          <span class="mode-best" id="best-daily"></span>
+        </button>
+        <button type="button" class="mode" id="btn-practice">
+          <span class="mode-title" data-i18n="practice"></span>
+          <span class="mode-sub" data-i18n="practiceSub"></span>
+          <span class="mode-best" id="best-practice"></span>
+        </button>
+        <button type="button" class="mode" id="btn-board">
+          <span class="mode-title" data-i18n="leaderboard"></span>
+          <span class="mode-sub" data-i18n="leaderboardSub"></span>
+        </button>
+      </div>
+
+      <div id="awards" class="card" hidden>
+        <h3 data-i18n="awardsTitle"></h3>
+        <ul id="award-list" class="plain"></ul>
+      </div>
+
+      <details class="how">
+        <summary data-i18n="howTitle"></summary>
+        <ol>
+          <li data-i18n="how1"></li>
+          <li data-i18n="how2"></li>
+          <li data-i18n="how3"></li>
+          <li data-i18n="how4"></li>
+          <li data-i18n="how5"></li>
+          <li data-i18n="how6"></li>
+        </ol>
+      </details>
+
+      <p class="proto" data-i18n="protoNote"></p>
+    </section>
+
+    <!-- GAME -->
+    <section id="screen-game" class="screen">
+      <div class="hud">
+        <div class="stat"><span class="lbl" data-i18n="score"></span><b id="hud-score">0</b></div>
+        <div class="stat mid"><span class="lbl" data-i18n="combo"></span><b id="hud-combo">0</b><small id="hud-mult">×1.0</small></div>
+        <div class="stat end"><span class="lbl" id="hud-time-lbl"></span><b id="hud-time">45</b></div>
+      </div>
+      <div class="timebar" aria-hidden="true">
+        <i id="timebar-fill"></i>
+        <u style="left:20%"></u><u style="left:40%"></u><u style="left:60%"></u><u style="left:80%"></u>
+      </div>
+      <div id="rule" class="rule" role="status" aria-live="polite">
+        <span id="rule-chips" class="chips"></span>
+        <span id="rule-text" class="rule-text"></span>
+        <span class="rule-hint" data-i18n="ruleChanging"></span>
+      </div>
+      <div class="field-wrap">
+        <canvas id="field"></canvas>
+        <div id="countdown" class="countdown" aria-hidden="true"></div>
+      </div>
+    </section>
+
+    <!-- RESULT -->
+    <section id="screen-result" class="screen">
+      <h2 class="res-title" id="res-title"></h2>
+      <p class="res-mode" id="res-mode"></p>
+      <div class="big-score">
+        <span id="res-score">0</span>
+        <small id="res-best"></small>
+      </div>
+      <p id="res-note" class="note" hidden></p>
+      <div class="tiles">
+        <div class="tile"><b id="res-hits">0</b><span data-i18n="hits"></span></div>
+        <div class="tile"><b id="res-perfects">0</b><span data-i18n="perfects"></span></div>
+        <div class="tile"><b id="res-combo">0</b><span data-i18n="maxCombo"></span></div>
+        <div class="tile"><b id="res-acc">0%</b><span data-i18n="accuracy"></span></div>
+        <div class="tile"><b id="res-wrong">0</b><span data-i18n="wrongs"></span></div>
+        <div class="tile"><b id="res-miss">0</b><span data-i18n="misses"></span></div>
+      </div>
+      <p class="reaction"><span data-i18n="avgReaction"></span>: <b id="res-react">0</b> ms</p>
+      <div class="actions">
+        <button type="button" class="mode primary center" id="btn-retry" hidden data-i18n="retry"></button>
+        <button type="button" class="mode primary center" id="btn-again"></button>
+        <button type="button" class="mode center" id="btn-result-board" data-i18n="viewBoard"></button>
+        <button type="button" class="mode center" id="btn-menu" data-i18n="menu"></button>
+      </div>
+    </section>
+
+    <!-- LEADERBOARD -->
+    <section id="screen-board" class="screen">
+      <div class="bar">
+        <button type="button" id="btn-board-back" class="link" data-i18n="back"></button>
+        <h2 data-i18n="leaderboard"></h2>
+      </div>
+      <div class="tiers" id="board-tiers" role="group">
+        <button type="button" data-btier="easy"></button>
+        <button type="button" data-btier="medium"></button>
+        <button type="button" data-btier="hard"></button>
+      </div>
+      <div class="tabs" id="board-scopes" role="group">
+        <button type="button" data-scope="day" data-i18n="scopeDay"></button>
+        <button type="button" data-scope="week" data-i18n="scopeWeek"></button>
+        <button type="button" data-scope="all" data-i18n="scopeAll"></button>
+      </div>
+      <div id="prizes" class="card" hidden>
+        <h3 data-i18n="prizesTitle"></h3>
+        <ul id="prize-list" class="plain"></ul>
+      </div>
+      <p id="board-me" class="me-rank" hidden></p>
+      <ol id="board-list" class="board"></ol>
+      <p id="board-empty" class="muted center" hidden data-i18n="boardEmpty"></p>
+    </section>
+
+    <div id="toast" class="toast" role="alert"></div>
+  </div>
+
+  <script src="core.js"></script>
+  <script src="i18n.js"></script>
+  <script src="main.js"></script>
+</body>
+</html>
