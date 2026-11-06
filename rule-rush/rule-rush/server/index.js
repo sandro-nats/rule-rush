@@ -8,35 +8,46 @@ const env = process.env;
 const dbPath = env.DB_PATH || path.join(__dirname, '..', 'data', 'rulerush.db');
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
+// Render / Railway / Fly set these. Auto-enable production cookie + proxy behaviour
+// when we detect a hosted environment so Mini App sessions work without foot-guns.
+const onRender = Boolean(env.RENDER || env.RENDER_EXTERNAL_URL || env.RAILWAY_ENVIRONMENT || env.FLY_APP_NAME);
+const cookieSecure = env.COOKIE_SECURE === '1' || (onRender && env.COOKIE_SECURE !== '0');
+const trustProxy = env.TRUST_PROXY === '1' || (onRender && env.TRUST_PROXY !== '0');
+
+// PUBLIC_HOST: explicit env, or derive from Render's external URL.
+let publicHost = env.PUBLIC_HOST || '';
+if (!publicHost && env.RENDER_EXTERNAL_URL) {
+  try { publicHost = new URL(env.RENDER_EXTERNAL_URL).host; } catch (e) { /* ignore */ }
+}
+if (!publicHost && env.RENDER_EXTERNAL_HOSTNAME) publicHost = env.RENDER_EXTERNAL_HOSTNAME;
+
 const app = createApp({
   dbPath,
   botToken: env.BOT_TOKEN || '',
   botUsername: (env.BOT_USERNAME || '').replace(/^@/, ''),
   adminToken: env.ADMIN_TOKEN || '',
   devAuth: env.DEV_AUTH === '1',
-  // Must be 1 on HTTPS production. Enables SameSite=None; Secure; Partitioned for Mini Apps.
-  cookieSecure: env.COOKIE_SECURE === '1',
-  trustProxy: env.TRUST_PROXY === '1',
-  // Comma-separated public hostnames for Origin CSRF checks behind reverse proxies.
-  // Example: PUBLIC_HOST=game.example.com
-  publicHost: env.PUBLIC_HOST || '',
+  cookieSecure,
+  trustProxy,
+  publicHost,
   dailyTrials: Math.max(1, parseInt(env.DAILY_TRIALS || '1', 10) || 1),
   seedSecret: env.SEED_SECRET || '',
+  // initData is only used to mint a long-lived session; 24h is Telegram's recommended window.
+  maxAuthAgeSec: parseInt(env.MAX_AUTH_AGE_SEC || String(24 * 3600), 10) || (24 * 3600),
   log: (...a) => console.error('[rule-rush]', ...a),
 });
 
-// Render / Fly / Railway / Docker inject PORT and expect the process to bind ALL interfaces.
-// Default to 0.0.0.0 so the platform health check can reach the port (127.0.0.1 fails scans).
-// Override with HOST=127.0.0.1 only for local-only binds.
+// Render injects PORT and expects bind on 0.0.0.0 (never 127.0.0.1).
 const port = parseInt(env.PORT || '8080', 10);
 const host = env.HOST || '0.0.0.0';
 app.listen(port, host).then((p) => {
   console.log('Rule Rush listening on http://' + host + ':' + p);
+  console.log('cookieSecure=' + cookieSecure + ' trustProxy=' + trustProxy + ' publicHost=' + (publicHost || '(none)'));
   if (!env.BOT_TOKEN || !env.BOT_USERNAME) console.warn('! BOT_TOKEN / BOT_USERNAME not set: Telegram login is disabled.');
   if (env.DEV_AUTH === '1') console.warn('! DEV_AUTH=1: anyone can log in as any dev user. Never enable this in production.');
   if (!env.ADMIN_TOKEN) console.warn('! ADMIN_TOKEN not set: admin API is disabled.');
-  if (env.COOKIE_SECURE !== '1') console.warn('! COOKIE_SECURE is not 1: set it when serving over HTTPS (required for Telegram Mini App cookies).');
-  if (env.TRUST_PROXY === '1' && !env.PUBLIC_HOST) console.warn('! TRUST_PROXY=1 without PUBLIC_HOST: set PUBLIC_HOST to your public domain so Origin CSRF checks succeed behind the proxy.');
+  if (!cookieSecure) console.warn('! COOKIE_SECURE is off: set COOKIE_SECURE=1 on HTTPS (required for Telegram Mini App cookies).');
+  if (trustProxy && !publicHost) console.warn('! TRUST_PROXY without PUBLIC_HOST: set PUBLIC_HOST to your public domain (e.g. rule-rush.onrender.com).');
 });
 
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => app.close().then(() => process.exit(0)));
