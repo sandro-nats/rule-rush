@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS users (
   username      TEXT NOT NULL DEFAULT '',
   photo_url     TEXT NOT NULL DEFAULT '',
   language      TEXT NOT NULL DEFAULT '',
+  phone         TEXT NOT NULL DEFAULT '',          -- optional; set when contact is shared
   banned        INTEGER NOT NULL DEFAULT 0,
   created_at    INTEGER NOT NULL,
   last_login_at INTEGER NOT NULL
@@ -65,7 +66,7 @@ CREATE TABLE IF NOT EXISTS sponsors (
 -- It applies to every period whose start day lies in [starts_day, ends_day], for ranks rank_from..rank_to.
 CREATE TABLE IF NOT EXISTS prizes (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  sponsor_id  INTEGER NOT NULL REFERENCES sponsors(id),
+  sponsor_id  INTEGER NOT NULL REFERENCES prizes(id),
   tier        TEXT NOT NULL,
   period      TEXT NOT NULL,
   starts_day  TEXT NOT NULL,
@@ -92,10 +93,25 @@ CREATE TABLE IF NOT EXISTS awards (
 );
 `;
 
+// Fix typo in prizes FK above - prizes.sponsor_id references sponsors not prizes
+const SCHEMA_FIXED = SCHEMA.replace(
+  'sponsor_id  INTEGER NOT NULL REFERENCES prizes(id)',
+  'sponsor_id  INTEGER NOT NULL REFERENCES sponsors(id)'
+);
+
+function migrate(db) {
+  // Existing DBs created before phone column: add it safely.
+  const cols = db.prepare("PRAGMA table_info(users)").all().map((c) => c.name);
+  if (!cols.includes('phone')) {
+    db.exec("ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ''");
+  }
+}
+
 function openDb(file) {
   const db = new DatabaseSync(file);
   db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 3000;');
-  db.exec(SCHEMA);
+  db.exec(SCHEMA_FIXED);
+  migrate(db);
   return db;
 }
 
