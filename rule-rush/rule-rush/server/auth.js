@@ -25,6 +25,14 @@ function freshness(authDate, nowSec, maxAgeSec) {
   return null;
 }
 
+function cleanPhone(v) {
+  if (typeof v !== 'string') return '';
+  // Keep digits and leading + only; Telegram contact phones look like +9955...
+  const s = v.trim().slice(0, 32);
+  if (!/^\+?[0-9]{5,20}$/.test(s)) return '';
+  return s;
+}
+
 function cleanUser(u) {
   if (!u || typeof u !== 'object' || Array.isArray(u)) return null;
   const id = Number(u.id);
@@ -33,6 +41,8 @@ function cleanUser(u) {
   let photo = str(u.photo_url, 300);
   // only ever store https image URLs (Telegram CDN / t.me)
   if (photo && !/^https:\/\//i.test(photo)) photo = '';
+  // phone may arrive via Login Widget rarely, or via WebApp contact share
+  const phone = cleanPhone(u.phone_number || u.phone || '');
   return {
     tg_id: id,
     first_name: str(u.first_name, 64),
@@ -40,6 +50,7 @@ function cleanUser(u) {
     username: str(u.username, 64),
     photo_url: photo,
     language: str(u.language_code, 8),
+    phone,
   };
 }
 
@@ -57,8 +68,6 @@ function fieldValue(v) {
 /**
  * Telegram Login Widget (browser login).
  * https://core.telegram.org/widgets/login#checking-authorization
- * secret = SHA256(bot_token); hash = HMAC_SHA256(secret, data_check_string)
- * `data` holds the widget fields (id, first_name, ..., auth_date, hash), as JSON body or callback query.
  */
 function verifyLoginWidget(data, botToken, nowSec, maxAgeSec) {
   if (!botToken) return { ok: false, error: 'login_not_configured' };
@@ -77,7 +86,6 @@ function verifyLoginWidget(data, botToken, nowSec, maxAgeSec) {
   if (!safeEqualHex(data.hash, expected)) return { ok: false, error: 'bad_hash' };
   const stale = freshness(data.auth_date, nowSec, maxAgeSec);
   if (stale) return { ok: false, error: stale };
-  // Login Widget puts user fields at the top level (id, first_name, …)
   const user = cleanUser(data);
   return user ? { ok: true, user } : { ok: false, error: 'bad_user' };
 }
@@ -85,11 +93,8 @@ function verifyLoginWidget(data, botToken, nowSec, maxAgeSec) {
 /**
  * Telegram Mini App (WebApp.initData) login.
  * https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app
- * secret = HMAC_SHA256(key = "WebAppData", message = bot_token)
  *
- * IMPORTANT (Bot API 8.0+): the `signature` field is an Ed25519 third-party
- * signature and MUST be excluded from data_check_string along with `hash`.
- * Including it makes authentic initData fail verification.
+ * IMPORTANT (Bot API 8.0+): exclude BOTH `hash` and `signature` from data_check_string.
  */
 function verifyWebAppInitData(initData, botToken, nowSec, maxAgeSec) {
   if (!botToken) return { ok: false, error: 'login_not_configured' };
@@ -99,7 +104,6 @@ function verifyWebAppInitData(initData, botToken, nowSec, maxAgeSec) {
   const hash = params.get('hash');
   if (!hash || hash.length !== 64) return { ok: false, error: 'bad_payload' };
 
-  // Exclude BOTH hash and signature (Bot API 8.0+ third-party validation field)
   const entries = [];
   for (const [k, v] of params.entries()) {
     if (k === 'hash' || k === 'signature') continue;
@@ -125,17 +129,42 @@ function verifyWebAppInitData(initData, botToken, nowSec, maxAgeSec) {
 /* ---------------- users & sessions ---------------- */
 
 function upsertUser(db, u, now) {
+  // Phone is sticky: only overwrite when a non-empty phone arrives (contact share).
   db.prepare(
-    `INSERT INTO users (tg_id, first_name, last_name, username, photo_url, language, created_at, last_login_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO users (tg_id, first_name, last_name, username, photo_url, language, phone, created_at, last_login_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(tg_id) DO UPDATE SET
-       first_name = excluded.first_name, last_name = excluded.last_name, username = excluded.username,
-       photo_url = excluded.photo_url, language = excluded.language, last_login_at = excluded.last_login_at`
-  ).run(u.tg_id, u.first_name, u.last_name, u.username, u.photo_url, u.language, now, now);
+       first_name = excluded.first_name,
+       last_name = excluded.last_name,
+       username = excluded.username,
+       photo_url = excluded.photo_url,
+       language = excluded.language,
+       phone = CASE WHEN excluded.phone != '' THEN excluded.phone ELSE users.phone END,
+       last_login_at = excluded.last_login_at`
+  ).run(
+    u.tg_id,
+    u.first_name,
+    u.last_name,
+    u.username,
+    u.photo_url,
+    u.language,
+    u.phone || '',
+    now,
+    now
+  );
   return db.prepare('SELECT * FROM users WHERE tg_id = ?').get(u.tg_id);
 }
 
-const SESSION_TTL_MS = 30 * 24 * 3600 * 1000;
+/** Update phone for an existing user (from WebApp.requestContact). */
+function setUserPhone(db, userId, phone, now) {
+  const p = cleanPhone(phone);
+  if (!p) return null;
+  db.prepare('UPDATE users SET phone = ?, last_login_at = ? WHERE id = ?').run(p, now, userId);
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+}
+
+// Long-lived sessions: 1 year. Sliding renewal on activity keeps users "permanently" logged in.
+const SESSION_TTL_MS = 365 * 24 * 3600 * 1000;
 const hashToken = (t) => sha256(t).toString('hex');
 
 function createSession(db, userId, source, now) {
@@ -145,15 +174,39 @@ function createSession(db, userId, source, now) {
   return token;
 }
 
+/**
+ * Prefer reusing a still-valid session for this user (same source) so relaunches
+ * keep working with the same stored Bearer token when possible.
+ * Falls back to minting a fresh token.
+ */
+function createOrReuseSession(db, userId, source, now) {
+  const existing = db.prepare(
+    `SELECT token_hash, expires_at FROM sessions
+      WHERE user_id = ? AND expires_at > ? AND source = ?
+      ORDER BY expires_at DESC LIMIT 1`
+  ).get(userId, now, source);
+  // We never store the raw token — cannot reuse an old raw token from DB.
+  // Always mint a new one, but prune old sessions for this user to avoid unbounded growth.
+  db.prepare('DELETE FROM sessions WHERE user_id = ? AND (expires_at <= ? OR source = ?)').run(userId, now, source);
+  return createSession(db, userId, source, now);
+}
+
 function userForToken(db, token, now) {
   if (typeof token !== 'string' || token.length < 20 || token.length > 100) return null;
   const row = db.prepare(
-    `SELECT u.*, s.expires_at AS s_exp FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`
+    `SELECT u.*, s.expires_at AS s_exp, s.token_hash AS s_hash FROM sessions s
+       JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`
   ).get(hashToken(token));
   if (!row) return null;
   if (row.s_exp <= now) {
     db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token));
     return null;
+  }
+  // Sliding expiry: extend while the user is active so they stay logged in.
+  const remaining = row.s_exp - now;
+  if (remaining < SESSION_TTL_MS / 2) {
+    db.prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?')
+      .run(now + SESSION_TTL_MS, hashToken(token));
   }
   return row;
 }
@@ -181,9 +234,7 @@ function parseCookies(header) {
 /**
  * Extract the session token from either:
  *  1) rr_session HttpOnly cookie (preferred)
- *  2) Authorization: Bearer <token>  (fallback when third-party cookies are blocked
- *     inside Telegram Web / some Desktop Mini App shells)
- * Cookie wins if both are present.
+ *  2) Authorization: Bearer <token>  (fallback when third-party cookies are blocked)
  */
 function extractSessionToken(req) {
   const cookies = parseCookies(req.headers.cookie);
@@ -197,14 +248,6 @@ function constantTimeStringEqual(a, b) {
   return crypto.timingSafeEqual(sha256(String(a)), sha256(String(b)));
 }
 
-/**
- * Build Set-Cookie header for the session token.
- * - HttpOnly so JS cannot steal it
- * - SameSite=None; Secure when HTTPS (required for Telegram Web iframe Mini Apps
- *   where the document is third-party relative to web.telegram.org)
- * - SameSite=Lax when not Secure (local HTTP dev)
- * - Partitioned for CHIPS-compatible third-party storage when Secure
- */
 function sessionCookieHeader(token, { secure, maxAgeSec }) {
   const parts = [
     'rr_session=' + encodeURIComponent(token),
@@ -213,12 +256,7 @@ function sessionCookieHeader(token, { secure, maxAgeSec }) {
     'Max-Age=' + String(maxAgeSec),
   ];
   if (secure) {
-    // Mini App may run in an iframe under web.telegram.org → third-party context.
-    // SameSite=Lax cookies are often dropped there; None+Secure is required.
-    parts.push('SameSite=None', 'Secure');
-    // CHIPS: store cookie in a partition keyed by top-level site (Telegram Web).
-    // Harmless where unsupported; helps where third-party cookies are blocked.
-    parts.push('Partitioned');
+    parts.push('SameSite=None', 'Secure', 'Partitioned');
   } else {
     parts.push('SameSite=Lax');
   }
@@ -236,7 +274,9 @@ function clearSessionCookieHeader({ secure }) {
 }
 
 module.exports = {
-  verifyLoginWidget, verifyWebAppInitData, upsertUser, createSession, userForToken, destroySession,
-  parseCookies, extractSessionToken, constantTimeStringEqual, sessionCookieHeader, clearSessionCookieHeader,
-  SESSION_TTL_MS, sha256, hmac,
+  verifyLoginWidget, verifyWebAppInitData, upsertUser, setUserPhone,
+  createSession, createOrReuseSession, userForToken, destroySession,
+  parseCookies, extractSessionToken, constantTimeStringEqual,
+  sessionCookieHeader, clearSessionCookieHeader,
+  SESSION_TTL_MS, sha256, hmac, cleanPhone,
 };
