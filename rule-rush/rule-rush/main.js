@@ -72,10 +72,36 @@
   const tierName = (t) => tr('tier' + t.charAt(0).toUpperCase() + t.slice(1));
 
   /* ---------------- Telegram integration ---------------- */
+  /** True when running inside a real Telegram client Mini App (has signed initData). */
+  const isMiniApp = Boolean(tg && typeof tg.initData === 'string' && tg.initData.length > 0);
+  const isTelegramShell = Boolean(tg);
+
   if (tg) {
     try { tg.ready(); tg.expand(); } catch (e) { /* ignore */ }
     try { tg.setHeaderColor('#0b1020'); tg.setBackgroundColor('#0b1020'); } catch (e) { /* ignore */ }
     try { if (typeof tg.disableVerticalSwipes === 'function') tg.disableVerticalSwipes(); } catch (e) { /* ignore */ }
+    try {
+      // Tell Telegram this is a full-height app; avoids half-sheet clipping.
+      if (typeof tg.setHeaderColor === 'function') tg.setHeaderColor('#0b1020');
+      if (typeof tg.isVerticalSwipesEnabled === 'boolean' && tg.isVerticalSwipesEnabled && typeof tg.disableVerticalSwipes === 'function') {
+        tg.disableVerticalSwipes();
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  /** Wait until Telegram injects initData (can be empty on the first paint). */
+  function waitForInitData(maxMs) {
+    return new Promise((resolve) => {
+      if (!tg) return resolve('');
+      if (tg.initData) return resolve(tg.initData);
+      const start = Date.now();
+      const tick = () => {
+        if (tg.initData) return resolve(tg.initData);
+        if (Date.now() - start >= (maxMs || 2500)) return resolve(tg.initData || '');
+        setTimeout(tick, 50);
+      };
+      tick();
+    });
   }
   function haptic(kind) {
     try {
@@ -115,7 +141,8 @@
     // Cookie still takes precedence server-side when present.
     if (token) headers['Authorization'] = 'Bearer ' + token;
     const opt = {
-      credentials: 'same-origin',
+      // include: ensure cookies travel even in odd Mini App WebView edge cases
+      credentials: 'include',
       headers,
     };
     if (body !== undefined) {
@@ -151,20 +178,21 @@
 
   /**
    * Mini App auto-login using Telegram.WebApp.initData.
-   * Safe to call repeatedly; no-ops when already logged in or initData is empty.
+   * Never prompts for phone — Telegram already identified the user.
    */
-  async function loginWithWebApp(force) {
-    if (!tg || !tg.initData) return { ok: false, reason: 'no_initdata' };
+  async function loginWithWebApp(force, initDataOverride) {
+    const initData = initDataOverride || (tg && tg.initData) || '';
+    if (!initData) return { ok: false, reason: 'no_initdata' };
     if (S.me && !force) return { ok: true, already: true };
     if (S.authing) return { ok: false, reason: 'busy' };
     S.authing = true;
     try {
-      const r = await api('/api/auth/webapp', { initData: tg.initData });
+      const r = await api('/api/auth/webapp', { initData });
       if (!r.ok) {
-        // Surface common production misconfigs in the console for operators.
         console.warn('[rule-rush] webapp login failed', r.status, r.data && r.data.error);
         return { ok: false, reason: (r.data && r.data.error) || 'login_failed', status: r.status };
       }
+      // api() already persisted data.session into sessionStore
       await loadMe();
       return { ok: Boolean(S.me) };
     } finally {
@@ -172,17 +200,73 @@
     }
   }
 
+  /**
+   * Canonical Mini App entry path:
+   *  1) wait for initData
+   *  2) silent server login (upserts user by tg_id, issues long-lived session)
+   *  3) load profile
+   * Never shows Login Widget / phone UI when initData is available.
+   */
+  async function ensureMiniAppSession() {
+    const hint = $('#tg-autologin');
+    if (hint) hint.hidden = false;
+    const initData = await waitForInitData(3000);
+    if (!initData) {
+      if (hint) hint.hidden = true;
+      return { ok: false, reason: 'no_initdata' };
+    }
+    // Always re-bind with live initData so relaunches pick up the same Telegram identity
+    // even if a stale Bearer token from another account was in localStorage.
+    const r = await loginWithWebApp(true, initData);
+    if (hint) hint.hidden = true;
+    return r;
+  }
+
   /** On 401 during play: try one silent re-login via initData, then reload me. */
   async function recoverSession() {
     sessionStore.clear();
     S.me = null;
-    if (tg && tg.initData) {
-      const r = await loginWithWebApp(true);
+    if (tg) {
+      const r = await ensureMiniAppSession();
       if (r.ok) return true;
     }
     renderAccount();
     renderMenu();
     return false;
+  }
+
+  /** Optionally request phone contact once (does not block auto-login). */
+  function maybeRequestPhone() {
+    if (!tg || !S.me || (S.me.user && S.me.user.hasPhone)) return;
+    if (store.get('rr_phone_asked') === '1') return;
+    // Only if the client exposes requestContact (Bot API 6.9+)
+    if (typeof tg.requestContact !== 'function') return;
+    store.set('rr_phone_asked', '1');
+    try {
+      tg.requestContact((shared) => {
+        // Newer clients: event-based. Older: callback may not fire; also listen.
+        if (!shared) return;
+      });
+    } catch (e) { /* ignore */ }
+    try {
+      if (typeof tg.onEvent === 'function') {
+        tg.onEvent('contactRequested', async (ev) => {
+          try {
+            const status = ev && (ev.status || ev);
+            // status can be "sent" | "cancelled" depending on client
+            if (status && String(status).toLowerCase().indexOf('cancel') >= 0) return;
+            // Some clients put phone on initDataUnsafe after share — re-auth to pick nothing;
+            // phone is delivered via the event payload when available.
+            const phone = (ev && (ev.response || ev.contact || ev).phone_number) ||
+              (ev && ev.phone_number) || '';
+            if (phone) {
+              const r = await api('/api/me/phone', { phone: String(phone) });
+              if (r.ok) { S.me = Object.assign({}, S.me, { user: r.data.user }); renderAccount(); }
+            }
+          } catch (err) { /* ignore */ }
+        });
+      }
+    } catch (e) { /* ignore */ }
   }
 
   /* ---------------- helpers ---------------- */
@@ -257,7 +341,18 @@
       holder.replaceWith(fresh);
       fresh.id = 'acc-avatar';
       $('#acc-name').textContent = S.me.user.name;
+    } else if (isTelegramShell) {
+      // Inside Telegram: never force Login Widget / phone entry — auto-login handles it.
+      $('#tg-widget').hidden = true;
+      $('#login-hint').hidden = true;
+      $('#dev-form').hidden = !S.config.devAuth;
+      const auto = $('#tg-autologin');
+      if (auto) auto.hidden = false;
     } else {
+      // Plain browser: show Login Widget
+      $('#tg-widget').hidden = false;
+      const auto = $('#tg-autologin');
+      if (auto) auto.hidden = true;
       mountTelegramWidget();
       $('#login-hint').hidden = Boolean(S.config.loginEnabled);
       $('#dev-form').hidden = !S.config.devAuth;
@@ -917,21 +1012,36 @@
     setAppHeight();
     applyLang();
     showScreen('menu');
+
+    // Normalize any deep-link path Telegram may open to "/" without a full reload of assets
+    // (server already SPA-fallbacks; this keeps the address bar clean).
+    try {
+      if (location.pathname !== '/' && location.pathname !== '/index.html' &&
+          !location.pathname.startsWith('/api') && !location.pathname.startsWith('/admin')) {
+        history.replaceState(null, '', '/' + (location.search || '') + (location.hash || ''));
+      }
+    } catch (e) { /* ignore */ }
+
     const cfg = await api('/api/config');
     if (cfg.ok) S.config = cfg.data;
 
-    // 1) Restore existing session (cookie and/or stored Bearer token)
-    await loadMe();
-
-    // 2) Mini App: if no session yet, bind the live Telegram profile via signed initData.
-    //    (When a valid cookie/Bearer already exists we keep it; Telegram reopens often
-    //     re-issue the same user, and re-auth is free if the session later 401s.)
-    if (!S.me && tg && tg.initData) {
-      const r = await loginWithWebApp(true);
+    if (isTelegramShell) {
+      // Mini App path: silent auto-login with initData — no phone number UI.
+      renderAccount(); // show "Signing in with Telegram…"
+      const r = await ensureMiniAppSession();
       if (!r.ok) {
+        // Fallback: try existing Bearer/cookie session
+        await loadMe();
+      }
+      if (!S.me) {
         $('#login-error').hidden = false;
         console.warn('[rule-rush] Mini App login failed:', r.reason || r.status);
+      } else {
+        maybeRequestPhone(); // optional, non-blocking
       }
+    } else {
+      // Browser: restore long-lived session; Login Widget available if logged out
+      await loadMe();
     }
 
     renderAccount();
@@ -942,5 +1052,10 @@
     }
   }
 
-  init();
+  // Boot even if DOM is still parsing (scripts are at end of body, so this is fine)
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function () { init(); });
+  } else {
+    init();
+  }
 }());
